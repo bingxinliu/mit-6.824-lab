@@ -1,10 +1,14 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"strconv"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -32,11 +36,77 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+    var id string
+    var nReduce int = 0
+    // call to get map work
+    args    := MapArgs{}
+    reply   := MapReply{}
+
+    args.Key = string(os.Getpid())
+
+    // register self
+    ok := call("Coordinator.Register", &args, &reply)
+    if ok {
+        var err error
+        nReduce, err = strconv.Atoi(reply.Key)
+        if err != nil { log.Fatal(err) }
+    } else {
+        fmt.Println("Error: can not get ID")
+    }
+
+    // get jod till should stop
+    for {
+        ok = call("Coordinator.GetWork", &args, &reply)
+        if !ok { fmt.Println("No Map work or Get map work failed") }
+            
+        // test
+        fmt.Println("Map work for file:", reply.Key)
+        filename := reply.Key
+        if reply.Key != "" {
+            contents, err := os.ReadFile(filename)
+            if err != nil { log.Fatal(err) }
+            kv := mapf(reply.Key, string(contents))
+
+            outfile, err := os.Create(fmt.Sprintf("mr-worker-%s", id))
+            if err != nil { log.Fatal(err) }
+
+            enc := json.NewEncoder(outfile)
+            for _, v := range kv {
+                err := enc.Encode(v)
+                if err != nil { log.Fatal(err) }
+            }
+        }
+
+        // tell coordinator we have finished
+        ok = call("Coordinator.CompleteWork", &args, &reply)
+        if !ok { log.Fatal("Coordinator.CompleteWork Failed") }
+            
+        ok = call("Coordinator.ShouldStop", &args, &reply)
+        if !ok { fmt.Println("Worker RPC Coordinator.ShouldStop failed") }
+
+        if reply.Key == "true" { break }
+
+    }
+    // At this point nothing can do, return.
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
 }
+            // encoding in json
+            // m := make(map[int]*json.Encoder)
+            // for _, v := range kv {
+                // // fmt.Println("[", v.Key, ",", v.Value, "]")
+                // bucknum := ihash(v.Key) % 10
+                // if _, ok := m[bucknum]; !ok {
+                    // outfile, err := os.Create(fmt.Sprintf("mr-out-%d", bucknum))
+                    // if err != nil { log.Fatal(err) }
+                    // m[bucknum] = json.NewEncoder(outfile)
+                // }
+                // // err := enc.Encode(v)
+                // err := m[bucknum].Encode(v)
+                // if err != nil { log.Fatal(err) }
+            // }
 
 //
 // example function to show how to make an RPC call to the coordinator.
