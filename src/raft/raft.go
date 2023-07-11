@@ -196,13 +196,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     case args.Term < rf.currentTerm:
         reply.Success = false
         reply.Term = rf.currentTerm
-        DPrintf("[%d] SERVER[%d] REJECT AERPC from SERVER[%d] TERM[%d]\n", rf.currentTerm, rf.me, args.LeaderId, args.Term)
+        DPrintf("[%d] SERVER[%d] REJECT AERPC from SERVER[%d] TERM[%d]\n",
+            rf.currentTerm, rf.me, args.LeaderId, args.Term,
+        )
     // TODO: match
     default:
         switch rf.role {
         case FOLLOWER:
             // Already a follower trigger another  ticker
-            DPrintf("[%d] FOLLOWER[%d] ACCEPT AERPC from SERVER[%d]\n", rf.currentTerm, rf.me, args.LeaderId)
+            DPrintf("[%d] FOLLOWER[%d] ACCEPT AERPC from SERVER[%d]\n",
+                rf.currentTerm, rf.me, args.LeaderId,
+            )
 
         case CANDIDATE:
             rf.role = FOLLOWER
@@ -211,8 +215,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             )
         case LEADER:
             rf.role = FOLLOWER
-            // lite debug
-            // fmt.Printf("[%d] ***LEADER[%d] ACCEPT AERPC from SERVER[%d] with TERM[%d], exit election***\n",rf.currentTerm, rf.me, args.LeaderId, args.Term)
             DPrintf(
                 "***[%d] LEADER[%d] ACCEPT AERPC from SERVER[%d], exit election***\n",
                 rf.currentTerm, rf.me, args.LeaderId,
@@ -276,7 +278,7 @@ func (rf *Raft) heartBeatThread() {
             // lite debug
             // fmt.Printf("SERVER[%d] send AERPC to SERVER[%d]\n", rf.me, idx)
             rf.mu.Lock()
-            DPrintf("LEADER[%d] send AERPC to SERVER[%d]\n", rf.me, idx)
+            DPrintf("[%d] LEADER[%d] send AERPC to SERVER[%d]\n", rf.currentTerm, rf.me, idx)
             var args = AppendEntriesArgs{ rf.currentTerm, rf.me, 0, 0, make([]interface{}, 0), 0 }
             var reply = AppendEntriesReply{ -1, false }
             rf.mu.Unlock()
@@ -285,7 +287,7 @@ func (rf *Raft) heartBeatThread() {
             defer rf.mu.Unlock()
             switch {
             case !ok:
-                DPrintf("LEADER[%d] CALL AERPC to SERVER[%d] failed\n", rf.me, idx)
+                DPrintf("[%d] WARNING: LEADER[%d] CALL AERPC to SERVER[%d] failed\n", rf.currentTerm, rf.me, idx)
             case reply.Success:
                 // tmp do nothing
             case !reply.Success:
@@ -512,7 +514,7 @@ func (rf *Raft) riseElection() {
                     rf.role = LEADER
                     // lite debug
                     // fmt.Printf("[%d] SERVER[%d] become to LEADER\n", rf.currentTerm, rf.me)
-                    DPrintf("SERVER[%d] become to LEADER\n", rf.me)
+                    DPrintf("[%d] SERVER[%d] become to LEADER\n", rf.currentTerm, rf.me)
                     // trigger heartbeat
                     go rf.heartBeatThread()
                 default:
