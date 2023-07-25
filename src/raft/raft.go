@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	// "fmt"
+	"bytes"
 	"log"
 	"math/rand"
 
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -56,10 +58,9 @@ type ApplyMsg struct {
 // --- added by lbx ---
 // enum role
 const (
-    INIT        uint = 0
-    FOLLOWER    = 1
-    CANDIDATE   = 2       
-    LEADER      = 3
+    FOLLOWER    uint = 0
+    CANDIDATE   = 1       
+    LEADER      = 2
 )
 
 type Entry struct {
@@ -80,6 +81,10 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
     applyCh     chan ApplyMsg
+
+    // init term flag ticker implementation is hard to understand so we have this flag to
+    // discriminate the situation
+    initTerm    bool
 
     // option
     hbIdx       uint
@@ -136,6 +141,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+    buffer := new(bytes.Buffer)
+    e := labgob.NewEncoder(buffer)
+    e.Encode(rf.currentTerm)
+    e.Encode(rf.votedFor)
+    e.Encode(rf.log)
+    raftstate := buffer.Bytes()
+    rf.persister.Save(raftstate, nil)
 }
 
 
@@ -157,6 +169,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+    readBuffer := bytes.NewBuffer(data)
+    d := labgob.NewDecoder(readBuffer)
+    var currentTerm int
+    var votedFor int
+    var rflog []Entry
+    if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&rflog) != nil {
+        log.Fatalf("Error: Decode problem\n")
+    } else {
+        rf.mu.Lock()
+        defer rf.mu.Unlock()
+        rf.currentTerm = currentTerm
+        rf.votedFor = votedFor
+        rf.log = rflog
+    }
 }
 
 
@@ -308,8 +334,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 rf.currentTerm, rf.me, rf.role,
             )
         }
-        if rf.heartbeated == nil {
-            // log.Fatalf("SERVER[%d] did not register its heartbeat flag", rf.me)
+        if rf.heartbeated == nil && rf.currentTerm != 0{
+            log.Fatalf(
+                "[%d] SERVER[%d] did not register its heartbeat flag",
+                rf.currentTerm, rf.me)
         } else {
             if rf.role == CANDIDATE {
                 log.Fatalf("Error: CANDIDATE[%d] heartbeated after valid AERPC\n", rf.me)
@@ -320,8 +348,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             *rf.heartbeated = true
         }
         rf.heartbeated = nil
-        reply.Success = true
-        reply.Term = rf.currentTerm
         if rf.role != FOLLOWER {
             rf.mu.Unlock()
             log.Fatalf("SERVER[%d] A heartbeated SERVER or CANDIDATE\n", rf.me)
@@ -349,6 +375,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 rf.currentTerm, rf.me, rf.lastApplied,
             )
         }
+
+        // rf.persist()
+        reply.Success = true
+        reply.Term = rf.currentTerm
 
         DbgPrintf(
             dTrace,
@@ -575,8 +605,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     )
     var role string
     switch rf.role {
-    case INIT:
-        role = "INI"
     case FOLLOWER:
         role = "FLW"
     case CANDIDATE:
@@ -608,13 +636,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         if rf.log[len(rf.log) - 1].Term <= args.LastLogTerm {
             if rf.log[len(rf.log) - 1].Term < args.LastLogTerm || len(rf.log) - 1 <= args.LastLogIndex {
                 rf.votedFor = args.CandidateId
-                reply.Term = rf.currentTerm
                 reply.VoteGranted = true
                 DbgPrintf(dVote, "[%d] %s %d  <-RVRPC- SVR[%d] ACCEPTED\n",
                     rf.currentTerm, role, rf.me, args.CandidateId)
 
                 // vote granted, reset timer
                 rf.heartbeated = nil
+                // rf.persist()
+                reply.Term = rf.currentTerm
                 ech := make(chan bool)
                 go rf.electionTicker(ech)
 
@@ -940,21 +969,26 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
         rf.mu.Lock()
-        switch rf.role {
-        case INIT:
-            // if it's the 1st round, just sleep
-            DbgPrintf(dTrace, "[%d] SVR %d  INIT\n", rf.currentTerm, rf.me)
+        switch {
+        case rf.initTerm:
+            // do nothing, unmark initial term flag
             rf.mu.Unlock()
-        case FOLLOWER:
-            // have received valid RPC, RPC will trigger ticker, just return
+            rf.initTerm = false
+        case rf.role == FOLLOWER:
+            if rf.heartbeated != nil {
+                // some one trigger heartbeat thread just return
+                rf.mu.Unlock()
+                return
+            } else {
+                // time to rise election
+                rf.riseElection()
+                return
+            }
+        case rf.role == CANDIDATE:
+            // no CANDIDATE should be here
             rf.mu.Unlock()
-            return
-        case CANDIDATE:
-            // no valid RPC received, rise a election
-            rf.riseElection()
-            return
-
-        case LEADER:
+            log.Fatalf("Error: A CANDIDATE[%d] appears after 1st round\n", rf.me)
+        case rf.role == LEADER:
             // a sever should not become to a LEADER after the 1st round, panic
             rf.mu.Unlock()
             log.Fatalf("Error: A LEADER[%d] appears after 1st round\n", rf.me)
@@ -965,9 +999,6 @@ func (rf *Raft) ticker() {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
-        rf.mu.Lock()
-        if rf.role == INIT { rf.role = CANDIDATE }
-        rf.mu.Unlock()
 	}
 }
 
@@ -988,6 +1019,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    rf.initTerm = true
 
     rf.applyCh = applyCh
 
@@ -1001,7 +1033,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
     rf.majority     = len(rf.peers) / 2 + 1
     rf.voteCount    = 0
-    rf.role         = INIT
+    rf.role         = FOLLOWER
     // a ticker theard should register its own heartbeat flag
     // an heartbeat rpc should set old flag as true and re-register flag
     rf.heartbeated  = nil
