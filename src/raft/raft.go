@@ -213,13 +213,14 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    persistentStateModified := false
     // lock 1st
     rf.mu.Lock()
     defer rf.mu.Unlock()
     // Handle rules for servers
     DbgPrintf(
         dTrace,
-        "[%d] SVR %d  <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d]\n\tCurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
+        "[%d] SVR %d  <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
         rf.currentTerm, rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm,
         len(args.Entries), args.LeaderCommit, rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex,
         rf.lastApplied,
@@ -248,7 +249,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.role = FOLLOWER
         rf.voteCount = 0
         rf.votedFor = -1
-
+        persistentStateModified = true
     }
     DbgPrintf(
         dTrace,
@@ -264,6 +265,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             "[%d] SVR %d  REJECT AERPC from SVR[%d] TERM[%d]\n",
             rf.currentTerm, rf.me, args.LeaderId, args.Term,
         )
+        if persistentStateModified {
+            log.Fatalf("[%d] SVR  %d change persistent state for a stale AERPC\n", rf.currentTerm, rf.me)
+        }
     case ((
         len(rf.log) <= args.PrevLogIndex) || (
         rf.log[args.PrevLogIndex].Term != args.PrevLogTerm)):
@@ -275,6 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             "[%d] SVR %d  REJECT AERPC from SVR[%d] TERM[%d]\n",
             rf.currentTerm, rf.me, args.LeaderId, args.Term,
         )
+        if persistentStateModified { rf.persist() }
     default:
         // at this point, server should accept AERPC, sync log[]
         nextMatchIndex := args.PrevLogIndex + 1
@@ -283,6 +288,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             if len(rf.log) <= nextMatchIndex { break }
             if rf.log[nextMatchIndex].Term != entry.Term {
                 rf.log = rf.log[:nextMatchIndex]
+                persistentStateModified = true
                 break
             }
             entryIndex += 1
@@ -290,6 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         }
         for entryIndex < len(args.Entries) {
             rf.log = append(rf.log, args.Entries[entryIndex])
+            persistentStateModified = true
             entryIndex += 1
             nextMatchIndex += 1
         }
@@ -376,7 +383,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             )
         }
 
-        // rf.persist()
+        if persistentStateModified { rf.persist() }
         reply.Success = true
         reply.Term = rf.currentTerm
 
@@ -436,6 +443,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     rf.mu.Unlock()
     ok := rf.sendAppendEntries(idx, &args, &reply)
     rf.mu.Lock()
+    persistentStateModified := false
     defer rf.mu.Unlock()
     DbgPrintf(
         dLog, "[%d] LDR %d -AERPC[%d]-> SVR[%d]: result get\n",
@@ -454,15 +462,15 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         // retry failed RPC
         if !heartbeatAERPC {
             rf.mu.Unlock()
-            time.Sleep(100 * time.Millisecond)
+            time.Sleep(10 * time.Millisecond)
             rf.mu.Lock()
             go rf.SendAndHandleAppendEntriesRPC(idx, false)
         }
         
     case reply.Success:
         // tmp do nothing
-        rf.nextIndex[idx] += len(args.Entries)
-        rf.matchIndex[idx] = rf.nextIndex[idx] - 1
+        rf.nextIndex[idx] = args.PrevLogIndex + len(args.Entries) + 1
+        rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
         // check commit status
         i := rf.commitIndex + 1
         for ; i < len(rf.log); i++ {
@@ -511,6 +519,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
             rf.role = FOLLOWER
             rf.voteCount = 0
             rf.votedFor = -1
+            persistentStateModified = true
             // reset timer
             rf.heartbeated = nil
             ech := make(chan bool)
@@ -534,6 +543,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
             go rf.SendAndHandleAppendEntriesRPC(idx, false)
         }
     }
+    if persistentStateModified { rf.persist() }
 }
 
 func (rf *Raft) heartBeatThread() {
@@ -564,7 +574,7 @@ func (rf *Raft) heartBeatThread() {
         go rf.SendAndHandleAppendEntriesRPC(idx, true)
         idx += 1
 
-        time.Sleep(100 * time.Millisecond)
+        time.Sleep(50 * time.Millisecond)
     }
     DbgPrintf(dTimer, "[%d] LDR %d  HB thread down\n", rf.currentTerm, rf.me)
 }
@@ -593,6 +603,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    persistentStateModified := false
     // lock 1st
     rf.mu.Lock()
     defer rf.mu.Unlock()
@@ -621,6 +632,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         role, rf.role = "FLW", FOLLOWER
         rf.voteCount = 0
         rf.votedFor = -1
+        persistentStateModified = true
     }
 
     // handle RVRPC
@@ -632,10 +644,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         DbgPrintf(
             dDrop, "[%d] %s %d  <-RVRPC- SVR[%d] REJECTED: stale RPC\n",
             rf.currentTerm, role, rf.me, args.CandidateId)
+        if persistentStateModified {
+            log.Fatalf("[%d] SVR  %d change persistent state for a stale RVRPC\n", rf.currentTerm, rf.me)
+        }
     case (rf.votedFor < 0 || rf.votedFor == args.CandidateId):
         if rf.log[len(rf.log) - 1].Term <= args.LastLogTerm {
             if rf.log[len(rf.log) - 1].Term < args.LastLogTerm || len(rf.log) - 1 <= args.LastLogIndex {
                 rf.votedFor = args.CandidateId
+                persistentStateModified = true
                 reply.VoteGranted = true
                 DbgPrintf(dVote, "[%d] %s %d  <-RVRPC- SVR[%d] ACCEPTED\n",
                     rf.currentTerm, role, rf.me, args.CandidateId)
@@ -643,7 +659,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
                 // vote granted, reset timer
                 *rf.heartbeated = true
                 rf.heartbeated = nil
-                // rf.persist()
+                // just in case
+                if persistentStateModified { rf.persist() }
                 reply.Term = rf.currentTerm
                 ech := make(chan bool)
                 go rf.electionTicker(ech)
@@ -667,6 +684,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             "[%d] SVR %d  <-RVRPC- SVR[%d] REJECT: votedfor[%d] last log[idx: %d, term: %d]\n",
             rf.currentTerm, rf.me, args.CandidateId, rf.votedFor, len(rf.log) - 1, rf.log[len(rf.log)-1].Term,
         )
+        if persistentStateModified { rf.persist() }
     }
 
 }
@@ -705,6 +723,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // --- added by lbx ---
 func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
+    persistentStateModified := false
     rf.mu.Lock()
     curTerm := rf.currentTerm
     args := RequestVoteArgs{
@@ -776,11 +795,11 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
                 rf.currentTerm, rf.me, idx,
             )
         case !reply.VoteGranted:
-            DbgPrintf(
-                dVote, "[%d] SVR %d  -RVRPC-> SVR[%d]: REJECTED\n",
-                rf.currentTerm, rf.me, idx,
-            )
             if rf.currentTerm < reply.Term {
+                DbgPrintf(
+                    dVote, "[%d] SVR %d  -RVRPC-> SVR[%d]: REJECTED by term\n",
+                    rf.currentTerm, rf.me, idx,
+                )
                 DbgPrintf(
                     dTrace,
                     "[%d] SVR %d  receive a advanced RVRPC result from[%d], step back to FOLLOWER with new term[%d]",
@@ -789,6 +808,12 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
                 rf.role = FOLLOWER
                 rf.voteCount = 0
                 rf.votedFor = -1
+                persistentStateModified = true
+            } else {
+                DbgPrintf(
+                    dVote, "[%d] SVR %d  -RVRPC-> SVR[%d]: REJECTED by stale log\n",
+                    rf.currentTerm, rf.me, idx,
+                )
             }
 
         default:
@@ -799,6 +824,7 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
             )
         }
     }
+    if persistentStateModified { rf.persist() }
 }
 
 func (rf *Raft) electionTicker(c chan bool) {
@@ -870,12 +896,13 @@ func (rf *Raft) electionTicker(c chan bool) {
     
 func (rf *Raft) riseElection() {
     ech := make(chan bool)
+    DbgPrintf(dVote, "[%d] SVR %d  become to CAN", rf.currentTerm, rf.me)
     rf.currentTerm += 1
     rf.role = CANDIDATE
-    DbgPrintf(dVote, "[%d] SVR %d  become to CAN", rf.currentTerm, rf.me)
     rf.voteCount = 1
     rf.votedFor = rf.me
     rf.heartbeated = nil
+    rf.persist()
     go rf.electionTicker(ech)
     finish, ok := <- ech
     if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
@@ -932,12 +959,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     default:
         index, term, isLeader = len(rf.log), rf.currentTerm, true
         rf.log = append(rf.log, Entry{ rf.currentTerm, command })
+        rf.persist()
         // TODO: sync heartbeat should do all things for us?
         // go rf.Sync()
         DbgPrintf(
             dLeader,
-            "[%d] LDR %d  received client reqeust, assign idx[%d]\n",
-            rf.currentTerm, rf.me, len(rf.log) - 1,
+            "[%d] LDR %d  received client reqeust, assign [idx:%d, value:%v]\n",
+            rf.currentTerm, rf.me, len(rf.log) - 1, command,
         )
     }
 	return index, term, isLeader
@@ -1034,7 +1062,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.log = make([]Entry, 0)
     padding := "PADDING"
     rf.log = append(rf.log, Entry{ 0, padding})
-
 
 
     rf.majority     = len(rf.peers) / 2 + 1
