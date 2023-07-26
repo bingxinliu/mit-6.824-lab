@@ -334,7 +334,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 rf.currentTerm, rf.me, rf.role,
             )
         }
-        if rf.heartbeated == nil && rf.currentTerm != 0{
+        if rf.heartbeated == nil {
             log.Fatalf(
                 "[%d] SERVER[%d] did not register its heartbeat flag",
                 rf.currentTerm, rf.me)
@@ -641,6 +641,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
                     rf.currentTerm, role, rf.me, args.CandidateId)
 
                 // vote granted, reset timer
+                *rf.heartbeated = true
                 rf.heartbeated = nil
                 // rf.persist()
                 reply.Term = rf.currentTerm
@@ -964,18 +965,20 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 
+    rf.mu.Lock()
+    heartbeated := false
+    rf.heartbeated = &heartbeated
+    
 	for rf.killed() == false {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-        rf.mu.Lock()
         switch {
         case rf.initTerm:
             // do nothing, unmark initial term flag
             rf.mu.Unlock()
-            rf.initTerm = false
         case rf.role == FOLLOWER:
-            if rf.heartbeated != nil {
+            if heartbeated {
                 // some one trigger heartbeat thread just return
                 rf.mu.Unlock()
                 return
@@ -999,7 +1002,10 @@ func (rf *Raft) ticker() {
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
+        rf.mu.Lock()
+        rf.initTerm = false
 	}
+    rf.mu.Unlock()
 }
 
 // the service or tester wants to create a Raft server. the ports
