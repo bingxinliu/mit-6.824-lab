@@ -12,22 +12,22 @@ from rich.traceback import install
 # fmt: off
 # Mapping from topics to colors
 TOPICS = {
-    "TIMR": "#9a9a99",
-    "VOTE": "#67a0b2",
-    "LEAD": "#d0b343",
+    "APDE": "#9a9a99",
+    "RQVT": "#67a0b2",
+    "HTBT": "#d0b343",
     "TERM": "#70c43f",
-    "LOG1": "#4878bc",
-    "LOG2": "#398280",
+    "VOTE": "#4878bc",
+    "ROLE": "#398280",
     "CMIT": "#98719f",
-    "PERS": "#d08341",
-    "SNAP": "#FD971F",
-    "DROP": "#ff615c",
-    "CLNT": "#00813c",
-    "TEST": "#fe2c79",
-    "INFO": "#ffffff",
-    "WARN": "#d08341",
-    "ERRO": "#fe2626",
-    "TRCE": "#fe2626",
+    "APLY": "#d08341",
+    "PERS": "#FD971F",
+    "SNAP": "#ff615c",
+    "TIME": "#00813c",
+    "TRCE": "#fe2c79",
+    "CNST": "#ffffff",
+    "STAT": "#d08341",
+    "INFO": "#fe2626",
+    "WARN": "#fe2626",
 }
 # fmt: on
 
