@@ -76,7 +76,7 @@ def main(
 
             if colorize and topic in TOPICS:
                 color = TOPICS[topic]
-                msg = f"TERM{term} [{color}]{msg}[/{color}]"
+                msg = f"{time} TERM{term} [{color}]{msg}[/{color}]"
 
             if n_columns is None or topic == "TEST":
                 print(time, msg)
