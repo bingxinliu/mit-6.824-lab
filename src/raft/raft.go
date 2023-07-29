@@ -226,9 +226,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     // Handle rules for servers
     DbgPrintf(
         dState,
-        "[%d] SVR %d <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
+        "[%d] SVR %d <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:%v cmtIdx:%d, lstAppliad:%d\n",
         rf.currentTerm, rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm,
-        len(args.Entries), args.LeaderCommit, rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex,
+        len(args.Entries), args.LeaderCommit, rf.currentTerm, rf.votedFor, len(rf.log),
+        rf.log[len(rf.log)-1], rf.commitIndex,
         rf.lastApplied,
     )
     for rf.commitIndex > rf.lastApplied {
@@ -299,12 +300,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         }
 
         reply.Success = false
+
         reply.Term = rf.currentTerm
         DbgPrintf(
             dTrace,
             "[%d] SVR %d REJECT AERPC from SVR[%d] TERM[%d], consist conflicting\n",
             rf.currentTerm, rf.me, args.LeaderId, args.Term,
         )
+
+        if rf.role != FOLLOWER {
+            DbgPrintf(dRole,
+                "[%d] SVR[%d] state[%d] step down to FLW\n",
+                rf.currentTerm, rf.me, rf.role)
+            rf.role = FOLLOWER
+        }
+
+        if rf.heartbeated == nil {
+            DbgPrintf(dWarn,
+                "[%d] SVR[%d] did not register its heartbeat flag",
+                rf.currentTerm, rf.me)
+        } else {
+            DbgPrintf(
+                dHBeat,
+                "[%d] FLW %d  heartbeated", rf.currentTerm, rf.me)
+            *rf.heartbeated = true
+        }
+        rf.heartbeated = nil
+        if rf.role != FOLLOWER {
+            rf.mu.Unlock()
+            log.Fatalf("SERVER[%d] A heartbeated SERVER or CANDIDATE\n", rf.me)
+        }
+        ech := make(chan bool)
+        go rf.electionTicker(ech)
+
+        finish, ok := <- ech
+        if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
+        if !finish { DbgPrintf(
+            dWarn, "[%d] SVR %d election ticker did not finish\n", rf.currentTerm, rf.me) }
+
         if persistentStateModified { rf.persist() }
     default:
         // at this point, server should accept AERPC, sync log[]
@@ -336,7 +369,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         }
         DbgPrintf(
             dConsist,
-            "[%d] SVR %d  Finish log upodate len(log)=%d !\n", rf.currentTerm, rf.me, len(rf.log))
+            "[%d] SVR %d Finish log upodate len(log)=%d !\n", rf.currentTerm, rf.me, len(rf.log))
 
         switch rf.role {
         case FOLLOWER:
@@ -368,7 +401,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             )
         }
         if rf.heartbeated == nil {
-            log.Fatalf(
+            DbgPrintf(dWarn,
                 "[%d] SERVER[%d] did not register its heartbeat flag",
                 rf.currentTerm, rf.me)
         } else {
@@ -435,12 +468,21 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         rf.mu.Unlock()
         return
     }
+    termBeforeSend := rf.currentTerm
     aerpcIdx := rf.aerpcIdx
     rf.aerpcIdx += 1
     if rf.nextIndex[idx] > len(rf.log) {
         log.Fatalf("FAIL: nextIdx[%d]: %d, len(rf.log): %d\n", idx, rf.nextIndex[idx], len(rf.log))
     }
     var args AppendEntriesArgs
+    // args = AppendEntriesArgs {
+    //     Term:           rf.currentTerm,
+    //     LeaderId:       rf.me,
+    //     PrevLogIndex:   rf.nextIndex[idx] - 1,
+    //     PrevLogTerm:    rf.log[rf.nextIndex[idx] - 1].Term,
+    //     Entries:        rf.log[rf.nextIndex[idx]:],
+    //     LeaderCommit:   rf.commitIndex,
+    // }
     if heartbeatAERPC {
         args = AppendEntriesArgs {
             Term:           rf.currentTerm,
@@ -467,40 +509,93 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         len(args.Entries), args.LeaderCommit,
     )
     rf.mu.Unlock()
+
+
+
     ok := rf.sendAppendEntries(idx, &args, &reply)
+
+    
+
     rf.mu.Lock()
     persistentStateModified := false
     defer rf.mu.Unlock()
+    if rf.killed() { return }
+    // if failed to send or ger result just return
+    if !ok {
+        DbgPrintf(
+            dWarn, "[%d] LDR %d -AERPC[%d]-> SVR[%d] failed\n",
+            rf.currentTerm, rf.me, aerpcIdx, idx)
+        // retry failed RPC
+        if !heartbeatAERPC && rf.role == LEADER && rf.currentTerm == termBeforeSend {
+            rf.mu.Unlock()
+            time.Sleep(10 * time.Millisecond)
+            rf.mu.Lock()
+            go rf.SendAndHandleAppendEntriesRPC(idx, false)
+        }
+        return
+    }
+
     DbgPrintf(
         dAERPC,
         "[%d] LDR %d -AERPC[%d]-> SVR[%d]: result get [XT:%d, XI:%d, XL:%d, T:%d, S:%t]\n",
         rf.currentTerm, rf.me, aerpcIdx, idx, reply.XTerm, reply.XIndex, reply.XLen, reply.Term,
         reply.Success,
     )
-    switch {
-    case rf.role != LEADER:
-        // if not a leader, just skip
+
+    // check term 1st
+    termBeforeUpdate := rf.currentTerm
+    if rf.currentTerm < reply.Term {
         DbgPrintf(
-            dInfo, "[%d] SVR %d -AERPC-> SVR[%d]: no longer LEADER\n",
+            dRole,
+            "[%d] LDR %d <-advanced AERPC- SVR[%d], a new leader exist step back to FLW with new term[%d]",
+            rf.currentTerm, rf.me, idx, reply.Term,
+        )
+        rf.currentTerm = reply.Term
+        rf.role = FOLLOWER
+        rf.voteCount = 0
+        rf.votedFor = -1
+        persistentStateModified = true
+        // reset timer
+        rf.heartbeated = nil
+        ech := make(chan bool)
+        go rf.electionTicker(ech)
+
+        finish, ok := <- ech
+        if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
+        if !finish {
+            DbgPrintf(
+                dWarn,
+                "[%d] SVR %d election ticker did not finish\n", rf.currentTerm, rf.me)
+        }
+    }
+    // check if the rpc stale
+    if termBeforeUpdate > termBeforeSend {
+        DbgPrintf(
+            dInfo, "[%d] SVR %d -AERPC-> SVR[%d]: sendTerm:%d, resultTerm:%d RPC result get: old term, drop it\n",
+            rf.currentTerm, rf.me, idx, termBeforeSend, termBeforeUpdate,
+        )
+        if persistentStateModified { rf.persist() }
+        return
+    }
+    // just in case:
+    if rf.role != LEADER {
+        DbgPrintf(
+            dInfo, "[%d] SVR %d -AERPC-> SVR[%d]: already no longer Leader, drop it\n",
             rf.currentTerm, rf.me, idx,
         )
-    case !ok:
-        DbgPrintf(
-            dWarn, "[%d] LDR %d -AERPC-> SVR[%d] failed\n", rf.currentTerm, rf.me, idx)
-        // retry failed RPC
-        if !heartbeatAERPC {
-            rf.mu.Unlock()
-            time.Sleep(10 * time.Millisecond)
-            rf.mu.Lock()
-            go rf.SendAndHandleAppendEntriesRPC(idx, false)
-        }
-        
+        if persistentStateModified { rf.persist() }
+        return
+    }
+
+    // check the result:
+    switch {
     case reply.Success:
-        // tmp do nothing
+
         rf.nextIndex[idx] = args.PrevLogIndex + len(args.Entries) + 1
         rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
         // check commit status
         i := rf.commitIndex + 1
+        commitIndexChanged := false
         for ; i < len(rf.log); i++ {
             count := 1
             for peerIdx := range rf.peers {
@@ -508,8 +603,14 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
             }
             if  count >= rf.majority && rf.log[i].Term == rf.currentTerm {
                 rf.commitIndex = i
+                commitIndexChanged = true
             }
         }
+        // sync for commitIndx
+        if commitIndexChanged {
+            go rf.Sync()
+        }
+
         // send committed entry to SM and applyCh
         for rf.commitIndex > rf.lastApplied {
             rf.lastApplied += 1
@@ -537,35 +638,12 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
 
     case !reply.Success:
         switch {
-        case rf.currentTerm < reply.Term:
+        case termBeforeSend < reply.Term:
             // caused by term step down
             DbgPrintf(
                 dRole,
-                "[%d] LDR %d <-advanced AERPC- SVR[%d], a new leader exist step back to FLW with new term[%d]",
-                rf.currentTerm, rf.me, idx, reply.Term,
-            )
-            rf.currentTerm = reply.Term
-            rf.role = FOLLOWER
-            rf.voteCount = 0
-            rf.votedFor = -1
-            persistentStateModified = true
-            // reset timer
-            rf.heartbeated = nil
-            ech := make(chan bool)
-            go rf.electionTicker(ech)
-
-            finish, ok := <- ech
-            if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
-            if !finish {
-                DbgPrintf(
-                    dWarn,
-                    "[%d] SVR %d election ticker did not finish\n", rf.currentTerm, rf.me)
-            }
-        case rf.currentTerm > reply.Term:
-            DbgPrintf(
-                dInfo,
-                "[%d] LDR %d -AERPC-> SVR[%d], result is stale, drop it\n",
-                rf.currentTerm, rf.me, idx,
+                "[%d] SVR %d -AERPC[%d]-> SVR[%d], result get, REJECTED for TERM[%d]",
+                rf.currentTerm, rf.me, aerpcIdx, idx, reply.Term,
             )
         default:
             // caused by log inconsistency
@@ -609,9 +687,13 @@ func (rf *Raft) heartBeatThread() {
 
         if idx >= len(rf.peers) {
             idx = 0
-            // rf.mu.Unlock()
-            // time.Sleep(time.Duration(1000 / (10 / (len(rf.peers) - 1))) * time.Millisecond)
-            // rf.mu.Lock()
+            if len(rf.peers) <= 10 {
+                rf.mu.Unlock()
+                time.Sleep(time.Duration(1000 / (10 / (len(rf.peers) - 1))) * time.Millisecond)
+                rf.mu.Lock()
+            } else {
+                log.Fatalln("Current does not support more than 10 servers")
+            }
         }
         if rf.me == idx {
             idx += 1
@@ -625,7 +707,7 @@ func (rf *Raft) heartBeatThread() {
         go rf.SendAndHandleAppendEntriesRPC(idx, true)
         idx += 1
 
-        time.Sleep(50 * time.Millisecond)
+        // time.Sleep(100 * time.Millisecond)
     }
     DbgPrintf(dHBeat, "[%d] LDR %d  HB thread down\n", rf.currentTerm, rf.me)
 }
@@ -661,9 +743,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // handle rules for servers
     DbgPrintf(
         dRVRPC,
-        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d]\tCurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
+        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:%v, cmtIdx:%d, lstAppliad:%d\n",
         rf.currentTerm, rf.me, args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm,
-        rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex, rf.lastApplied,
+        rf.currentTerm, rf.votedFor, len(rf.log), rf.log[len(rf.log)-1], rf.commitIndex, rf.lastApplied,
     )
     var role string
     switch rf.role {
@@ -774,9 +856,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // --- added by lbx ---
 func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
-    persistentStateModified := false
     rf.mu.Lock()
-    curTerm := rf.currentTerm
+    termBeforeSend := rf.currentTerm
     args := RequestVoteArgs{
         Term:           rf.currentTerm,
         CandidateId:    rf.me,
@@ -785,25 +866,62 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
     }
     rf.mu.Unlock()
     reply := RequestVoteReply{ -1, false }
+
+
+
     ok := rf.sendRequestVote(idx, &args, &reply)
+
+
+
     rf.mu.Lock()
     defer rf.mu.Unlock()
-    if rf.role == FOLLOWER {
+    if rf.killed() { return }
+    // if failed to send or ger result just return
+    if !ok {
         DbgPrintf(
-            dInfo, "[%d] FLW %d -RVRPC-> SVR[%d]: already step down to FLW, drop\n",
+            dWarn, "[%d] SVR %d can not call RV to SVR[%d]\n",
             rf.currentTerm, rf.me, idx,
         )
         return
     }
-    if rf.currentTerm > curTerm {
+    DbgPrintf(
+        dRVRPC,
+        "[%d] SVR %d -RVRPC-> SVR[%d]: result get [T:%d, G:%t]\n",
+        rf.currentTerm, rf.me, idx, reply.Term, reply.VoteGranted,
+    )
+    // Get result (granted or not) check, check term 1st
+    termBeforeUpdate := rf.currentTerm
+    if rf.currentTerm < reply.Term {
         DbgPrintf(
-            dInfo, "[%d] FLW %d <-RVRPC- SVR[%d]: old term[%d] RPC\n",
-            rf.currentTerm, rf.me, idx, curTerm,
+            dRole,
+            "[%d] SVR %d receive a advanced RVRPC result from[%d], step back to FOLLOWER with new term[%d]",
+            rf.currentTerm, rf.me, idx, reply.Term)
+        rf.currentTerm = reply.Term
+        rf.role = FOLLOWER
+        rf.voteCount = 0
+        rf.votedFor = -1
+        rf.persist()
+    }
+    // check if it is a old term rpc
+    if termBeforeUpdate > termBeforeSend {
+        DbgPrintf(
+            dInfo, "[%d] SVR %d -RVRPC-> SVR[%d]: sendTerm:%d, resultTerm:%d RPC result get: old term, drop it\n",
+            rf.currentTerm, rf.me, idx, termBeforeSend, termBeforeUpdate,
         )
+        return
+    }
+    // just in case
+    if rf.role == FOLLOWER {
+        DbgPrintf(
+            dInfo, "[%d] FLW %d -RVRPC-> SVR[%d]: result get, already step down to FLW, drop\n",
+            rf.currentTerm, rf.me, idx,
+        )
+        return
     }
 
-
-    if ok && reply.VoteGranted {
+    // check the result:
+    switch {
+    case reply.VoteGranted:
         rf.voteCount += 1
         // got more votes than majority
         switch {
@@ -838,44 +956,20 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
                 rf.currentTerm, rf.me, idx,
             )
         }
-    } else {
-        switch {
-        case !ok:
+    case !reply.VoteGranted:
+        if termBeforeSend < reply.Term {
             DbgPrintf(
-                dWarn, "[%d] SVR %d can not call RV to SVR[%d]\n",
+                dRVRPC, "[%d] SVR %d -RVRPC-> SVR[%d]: REJECTED by term\n",
                 rf.currentTerm, rf.me, idx,
             )
-        case !reply.VoteGranted:
-            if rf.currentTerm < reply.Term {
-                DbgPrintf(
-                    dRVRPC, "[%d] SVR %d -RVRPC-> SVR[%d]: REJECTED by term\n",
-                    rf.currentTerm, rf.me, idx,
-                )
-                DbgPrintf(
-                    dRole,
-                    "[%d] SVR %d  receive a advanced RVRPC result from[%d], step back to FOLLOWER with new term[%d]",
-                    rf.currentTerm, rf.me, idx, reply.Term)
-                rf.currentTerm = reply.Term
-                rf.role = FOLLOWER
-                rf.voteCount = 0
-                rf.votedFor = -1
-                persistentStateModified = true
-            } else {
-                DbgPrintf(
-                    dRVRPC, "[%d] SVR %d -RVRPC-> SVR[%d]: REJECTED by stale log\n",
-                    rf.currentTerm, rf.me, idx,
-                )
-            }
-
-        default:
+        } else {
             DbgPrintf(
-                dWarn,
-                "[%d] SVR %d  A not ok and not granted RVRPC result from SVR[%d]\n",
+                dRVRPC, "[%d] SVR %d -RVRPC-> SVR[%d]: REJECTED by stale log\n",
                 rf.currentTerm, rf.me, idx,
             )
         }
     }
-    if persistentStateModified { rf.persist() }
+
 }
 
 func (rf *Raft) electionTicker(c chan bool) {
@@ -885,22 +979,26 @@ func (rf *Raft) electionTicker(c chan bool) {
     if rf.heartbeated != nil { log.Fatalln("Error: prev thread does not clear heartbeated flag") }
     rf.heartbeated = &heartbeated
     if heartbeated { log.Fatalln("Error: heartbeated before sleep in ticker") }
+    ms := 500 + (rand.Int63() % 300)
     DbgPrintf(
         dTimer,
-        "[%d] SVR %d state[%d] ticker start in round[%d]\n",
-        rf.currentTerm, rf.me, rf.role, hbIdx,
+        "[%d] SVR %d state[%d] ticker start in round[%d] sleep %d milliseconds\n",
+        rf.currentTerm, rf.me, rf.role, hbIdx, ms,
     )
     c <- true
 
-    ms := 500 + (rand.Int63() % 300)
     time.Sleep(time.Duration(ms) * time.Millisecond)
     rf.mu.Lock()
+    if rf.killed() {
+        rf.mu.Unlock()
+        return
+    }
     DbgPrintf(
         dTimer,
         "[%d] SVR %d state[%d] heartbeated?%t in round[%d]\n",
         rf.currentTerm, rf.me, rf.role, heartbeated, hbIdx,
     )
-    if rf.killed() || hbIdx < rf.hbIdx - 1 {
+    if hbIdx < rf.hbIdx - 1 {
         rf.mu.Unlock()
         return
     }
@@ -923,11 +1021,11 @@ func (rf *Raft) electionTicker(c chan bool) {
         // }()
         return
     case CANDIDATE:
-        if heartbeated {
-            rf.mu.Unlock()
-            // return
-            log.Fatalf("Error: A heartbeated CANDIDATE[%d]", rf.me)
-        }
+        // if heartbeated {
+        //     rf.mu.Unlock()
+        //     // return
+        //     log.Fatalf("Error: A heartbeated CANDIDATE[%d]", rf.me)
+        // }
         DbgPrintf(dTimer, "[%d] CAN %d rise re-election", rf.currentTerm, rf.me)
         rf.riseElection()
         return
@@ -952,6 +1050,7 @@ func (rf *Raft) riseElection() {
     rf.role = CANDIDATE
     rf.voteCount = 1
     rf.votedFor = rf.me
+    *rf.heartbeated = true
     rf.heartbeated = nil
     rf.persist()
     go rf.electionTicker(ech)
@@ -978,7 +1077,14 @@ func (rf *Raft) riseElection() {
 }
 
 func (rf *Raft) Sync() {
-
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    for i := 0; i < len(rf.peers); i++ {
+        if i == rf.me { continue }
+        rf.mu.Unlock()
+        go rf.SendAndHandleAppendEntriesRPC(i, false)
+        rf.mu.Lock()
+    }
 }
 // --- added end ---
 
@@ -1011,13 +1117,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
         index, term, isLeader = len(rf.log), rf.currentTerm, true
         rf.log = append(rf.log, Entry{ rf.currentTerm, command })
         rf.persist()
-        // TODO: sync heartbeat should do all things for us?
-        // go rf.Sync()
         DbgPrintf(
             dInfo,
             "[%d] LDR %d received client reqeust, assign |idx:%d, value:%v|\n",
             rf.currentTerm, rf.me, len(rf.log) - 1, command,
         )
+        // TODO: sync heartbeat should do all things for us?
+        // in lab we can not b/c performance limit
+        go rf.Sync()
     }
 	return index, term, isLeader
 }
@@ -1046,6 +1153,7 @@ func (rf *Raft) ticker() {
 
     rf.mu.Lock()
     heartbeated := false
+    // startTerm := rf.currentTerm
     rf.heartbeated = &heartbeated
     
 	for rf.killed() == false {
@@ -1054,8 +1162,13 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
         switch {
         case rf.initTerm:
+            DbgPrintf(dInfo,
+                "[%d] SVR %d INIT\n", rf.currentTerm, rf.me,
+            )
             // do nothing, unmark initial term flag
             rf.mu.Unlock()
+        // case rf.currentTerm != startTerm && heartbeated:
+        //    return
         case rf.role == FOLLOWER:
             if heartbeated {
                 // some one trigger heartbeat thread just return
@@ -1068,12 +1181,22 @@ func (rf *Raft) ticker() {
             }
         case rf.role == CANDIDATE:
             // no CANDIDATE should be here
-            rf.mu.Unlock()
-            log.Fatalf("Error: A CANDIDATE[%d] appears after 1st round\n", rf.me)
+            if heartbeated {
+                rf.mu.Unlock()
+                return
+            } else {
+                rf.mu.Unlock()
+                log.Fatalf("Error: A CANDIDATE[%d] appears after 1st round\n", rf.me)
+            }
         case rf.role == LEADER:
             // a sever should not become to a LEADER after the 1st round, panic
-            rf.mu.Unlock()
-            log.Fatalf("Error: A LEADER[%d] appears after 1st round\n", rf.me)
+            if heartbeated {
+                rf.mu.Unlock()
+                return
+            } else {
+                rf.mu.Unlock()
+                log.Fatalf("Error: A LEADER[%d] appears after 1st round\n", rf.me)
+            }
         }
 
 		// pause for a random amount of time between 50 and 350
