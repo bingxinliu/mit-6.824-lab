@@ -26,6 +26,7 @@ type logTopic string
 const (
     dAERPC   logTopic = "APDE"
     dRVRPC   logTopic = "RQVT"
+    dISRPC   logTopic = "ISNP"
 	dHBeat   logTopic = "HTBT"
 	dTerm    logTopic = "TERM"
 	dVote    logTopic = "VOTE"

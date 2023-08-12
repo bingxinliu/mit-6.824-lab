@@ -14,6 +14,7 @@ from rich.traceback import install
 TOPICS = {
     "APDE": "#9a9a99",
     "RQVT": "#67a0b2",
+    "ISNP": "#67a0b2",
     "HTBT": "#d0b343",
     "TERM": "#70c43f",
     "VOTE": "#4878bc",
