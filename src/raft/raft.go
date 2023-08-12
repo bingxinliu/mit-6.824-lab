@@ -82,6 +82,9 @@ type Raft struct {
 	// state a Raft server must maintain.
     applyCh     chan ApplyMsg
 
+    // helper index pointing to the last log's index
+    // currentIndex int
+
     // init term flag ticker implementation is hard to understand so we have this flag to
     // discriminate the situation
     initTerm    bool
@@ -113,6 +116,8 @@ type Raft struct {
     // offset for snapshot
     lastIncludedIndex   int
     lastIncludedTerm    int
+    // Snapshot
+    snapShot   *[]byte 
 }
 
 // return currentTerm and whether this server
@@ -153,7 +158,11 @@ func (rf *Raft) persist() {
     e.Encode(rf.lastIncludedIndex)
     e.Encode(rf.lastIncludedTerm)
     raftstate := buffer.Bytes()
-    rf.persister.Save(raftstate, nil)
+    if rf.snapShot == nil {
+        rf.persister.Save(raftstate, nil)
+    } else {
+        rf.persister.Save(raftstate, *rf.snapShot)
+    }
 }
 
 
@@ -182,6 +191,7 @@ func (rf *Raft) readPersist(data []byte) {
     var rflog []Entry
     var lastIncludedIndex int
     var lastIncludedTerm int
+    // var snapShot []byte
     if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&rflog) != nil {
         log.Fatalf("Error: Decode problem\n")
     } else {
@@ -192,8 +202,15 @@ func (rf *Raft) readPersist(data []byte) {
         rf.log = rflog
         rf.lastIncludedIndex = lastIncludedIndex
         rf.lastIncludedTerm = lastIncludedTerm
+        // rf.snapShot = snapShot
     }
 }
+
+// --- added by lbx ---
+func (rf *Raft) ApplyCommand(applyCh chan ApplyMsg, command interface{}, commandIndex int) {
+
+}
+// --- added end ---
 
 
 // the service says it has created a snapshot that has
@@ -204,44 +221,308 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
     // At beginning just set index to 0
     // index = 4
-    // rf.mu.Lock()
-    // defer rf.mu.Unlock()
-    if index >= len(rf.log) + rf.lastIncludedIndex + 1 {
-        // can not trim b/c log too short
-        DbgPrintf(dInfo,
-            "[%d] SVR %d Snapshot() called failed, too short log length. idx:%d, len:%d\n",
-            rf.currentTerm, rf.me, index, len(rf.log),
-        )
-        return
-    }
-
-    if rf.role == LEADER {
-        for i := 0; i < len(rf.peers); i++ {
-            if i == rf.me { continue }
-            if rf.matchIndex[i] < index {
-                // DbgPrintf(dInfo,
-                //     "[%d] LDR %d Snapshot() called failed, SVR(%d) does not catch up\n",
-                //     rf.currentTerm, rf.me, i,
-                // )
-                index = rf.matchIndex[i]
-            }
+    // a wrapper for fixing stupid test design
+    go func(index int, snapshot []byte) {
+        rf.mu.Lock()
+        defer rf.mu.Unlock()
+        if index >= len(rf.log) + rf.lastIncludedIndex + 1 {
+            // can not trim b/c log too short
+            DbgPrintf(dInfo,
+                "[%d] SVR %d Snapshot() called failed, too short log length. idx:%d, len:%d\n",
+                rf.currentTerm, rf.me, index, len(rf.log),
+            )
+            return
         }
-    }
 
-    // TODO: not necessary
-    if index <= rf.lastIncludedIndex { return }
-    rf.lastIncludedTerm = rf.log[index-rf.lastIncludedIndex-1].Term
-    rf.log = rf.log[index-rf.lastIncludedIndex:]
-    rf.lastIncludedIndex = index
-    rf.persist()
-    DbgPrintf(dSnap,
-        "[%d] SVR %d Snapshot() called idx:%d\n",
-        rf.currentTerm, rf.me, index,
-    )
+        // if rf.role == LEADER {
+        //     for i := 0; i < len(rf.peers); i++ {
+        //         if i == rf.me { continue }
+        //         if rf.matchIndex[i] < index {
+        //             // DbgPrintf(dInfo,
+        //             //     "[%d] LDR %d Snapshot() called failed, SVR(%d) does not catch up\n",
+        //             //     rf.currentTerm, rf.me, i,
+        //             // )
+        //             index = rf.matchIndex[i]
+        //         }
+        //     }
+        // }
+
+        // TODO: not necessary
+        if index <= rf.lastIncludedIndex {
+            // log.Fatalf("Error Snapshot Conflict\n")
+            return
+        }
+        rf.lastIncludedTerm = rf.log[index-rf.lastIncludedIndex-1].Term
+        rf.log = rf.log[index-rf.lastIncludedIndex:]
+        rf.lastIncludedIndex = index
+        rf.snapShot = &snapshot
+        rf.persist()
+        // fixing stupid ingestSnap design
+        // if rf.lastApplied < rf.lastIncludedIndex {
+            rf.lastApplied = rf.lastIncludedIndex
+        // }
+        if rf.commitIndex < rf.lastIncludedIndex {
+            rf.commitIndex = rf.lastIncludedIndex
+        }
+        applyMsg := ApplyMsg{
+            CommandValid    : false,
+            Command         : nil,
+            CommandIndex    : -1,
+            SnapshotValid   : true,
+            Snapshot        : *rf.snapShot,
+            SnapshotTerm    : rf.lastIncludedTerm,
+            SnapshotIndex   : rf.lastIncludedIndex,
+        }
+        rf.applyCh <- applyMsg
+        DbgPrintf(dSnap,
+            "[%d] SVR %d Snapshot() called idx:%d\n",
+            rf.currentTerm, rf.me, index,
+        )
+    }(index, snapshot)
 
 }
 
 // --- added by lbx ---
+// TODO: may templatized by reflect
+func (rf *Raft) checkAllServersRules(term, leaderId int) bool {
+    persistentStateModified := false
+    for rf.commitIndex > rf.lastApplied {
+        rf.lastApplied += 1
+        applyMsg := ApplyMsg {
+            CommandValid    : true,
+            Command         : rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
+            CommandIndex    : rf.lastApplied,
+            SnapshotValid   : false,
+            Snapshot        : nil,
+            SnapshotTerm    : -1,
+            SnapshotIndex   : -1,
+        }
+        rf.applyCh <- applyMsg
+        DbgPrintf(
+            dApply,
+            "[%d] SVR %d apply command[%d] into SM (checkAllServersRules)\n",
+            rf.currentTerm, rf.me, rf.lastApplied,
+        )
+    }
+    if term > rf.currentTerm {
+        DbgPrintf(
+            dTerm,
+            "[%d] SVR %d receive advanced AERPC from LDR[%d] with TERM[%d] step down to FOLLOWER\n",
+            rf.currentTerm, rf.me, leaderId, term,
+        )
+        rf.currentTerm = term
+        rf.role = FOLLOWER
+        rf.voteCount = 0
+        rf.votedFor = -1
+        persistentStateModified = true
+    }
+    DbgPrintf(
+        dTrace,
+        "[%d] SVR %d all servers rules checked\n", rf.currentTerm, rf.me,
+    )
+    return persistentStateModified
+}
+
+type InstallSnapshotArgs struct {
+    Term                int
+    LeaderId            int
+    LastIncludeIndex    int
+    LastIncludeTerm     int
+    // offset is not used in this lab, so as Done
+    Offset              int
+    Data                []byte
+    Done                bool
+}
+
+type InstallSnapshotReply struct {
+    Term                int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+    persistentStateModified := false
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    DbgPrintf(
+        dState,
+        "[%d] SVR %d <-ISRPC- LDR[%d], [T:%d, Lid:%d, LII:%d, LIT:%d, Off:%d, Len(Data):%d, Done:%t] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:v cmtIdx:%d, lastIncluIdx:%d, lstAppliad:%d\n",
+        rf.currentTerm, rf.me, args.LeaderId,
+        args.Term, args.LeaderId, args.LastIncludeIndex, args.LastIncludeTerm, args.Offset, len(args.Data), args.Done,
+        rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex, rf.lastIncludedIndex, rf.lastApplied,
+    )
+
+    // Handle rules for servers
+    persistentStateModified = rf.checkAllServersRules(args.Term, args.LeaderId)
+    // Handle RPC
+    switch {
+    case args.Term < rf.currentTerm:
+        reply.Term = rf.currentTerm
+        DbgPrintf(dTrace,
+            "[%d] SVR %d REJECT ISRPC from SVR[%d] TERM[%d]: stale ISRPC\n",
+            rf.currentTerm, rf.me, args.LeaderId, args.Term,
+        )
+        if persistentStateModified {
+            log.Fatalf("[%d] SVR %d change persistent state for a stale ISRPC\n", rf.currentTerm, rf.me)
+        }
+    default:
+        reply.Term = rf.currentTerm
+        // TODO:
+        // 1. Reply immediately if term < currentTerm
+        // 2. Create new snapshot file if first chunk (offset is 0)
+        // 3. Write data into snapshot file at given offset
+        // 4. Reply and wait for more data chunks if done is false
+        // 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
+        rf.snapShot = &args.Data
+        switch {
+        case args.LastIncludeIndex < rf.lastIncludedIndex :
+            DbgPrintf(dInfo,
+                "[%d] SVR %d Snapshot Conflict: args.LII:%d, rf.LII:%d drop ISRPC\n",
+                rf.currentTerm, rf.me, args.LastIncludeIndex, rf.lastIncludedIndex)
+            return
+        case args.LastIncludeIndex == rf.lastIncludedIndex :
+            DbgPrintf(dTrace,
+                "[%d] SVR %d REJECT ISRPC from SVR[%d] TERM[%d]: duplicated ISRPC\n",
+                rf.currentTerm, rf.me, args.LeaderId, args.Term,
+            )
+            return
+        case rf.lastIncludedIndex + len(rf.log) > args.LastIncludeIndex:
+            rf.log = rf.log[args.LastIncludeIndex-rf.lastIncludedIndex:]
+        default:
+            rf.log = rf.log[0:0]
+            // TODO:
+            // 8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+        }
+        
+        rf.lastIncludedIndex = args.LastIncludeIndex
+        rf.lastIncludedTerm = args.LastIncludeTerm
+        // fix stupid ingestSnap design
+        // if rf.lastApplied < rf.lastIncludedIndex { rf.lastApplied = rf.lastIncludedIndex }
+        rf.lastApplied = rf.lastIncludedIndex
+        if rf.commitIndex < rf.lastIncludedIndex { rf.commitIndex = rf.lastIncludedIndex }
+
+        applyMsg := ApplyMsg{
+            CommandValid    : false,
+            Command         : nil,
+            CommandIndex    : -1,
+            SnapshotValid   : true,
+            Snapshot        : *rf.snapShot,
+            SnapshotTerm    : rf.lastIncludedTerm,
+            SnapshotIndex   : rf.lastIncludedIndex,
+        }
+        rf.applyCh <- applyMsg
+
+
+        persistentStateModified = true
+        DbgPrintf(dState,
+            "[%d] SVR %d <-ISRPC- LDR[%d] ACCEPTED CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:v cmtIdx:%d, lastIncluIdx:%d, lstAppliad:%d\n",
+            rf.currentTerm, rf.me, args.LeaderId,
+            rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex, rf.lastIncludedIndex, rf.lastApplied,
+        )
+    }
+    if persistentStateModified { rf.persist() }
+
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+    return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+}
+
+func (rf *Raft) SendAndHandleInstallSnapshotRPC(idx int) {
+    var termBeforeSend int
+    args := InstallSnapshotArgs{}
+    reply := InstallSnapshotReply{ -1 }
+    rf.mu.Lock()
+    if rf.role != LEADER { return }
+    termBeforeSend = rf.currentTerm
+    // Init args
+    args.Term = rf.currentTerm
+    args.LeaderId = rf.me
+    args.LastIncludeIndex = rf.lastIncludedIndex
+    args.LastIncludeTerm = rf.lastIncludedTerm
+    args.Offset = 0
+    args.Data = *rf.snapShot
+    args.Done = true
+    rf.mu.Unlock()
+
+
+    ok := rf.sendInstallSnapshot(idx, &args, &reply)
+
+
+    persistentStateModified := false
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    switch {
+    case rf.killed():
+        return
+    case rf.role != LEADER:
+        DbgPrintf(dInfo,
+            "[%d] SVR %d -ISRPC-> SVR[%d]: already no longer Leader, drop it\n",
+            rf.currentTerm, rf.me, idx,
+        )
+        return
+    }
+
+    // check result
+    switch {
+    case !ok:
+        DbgPrintf(
+            dWarn, "[%d] LDR %d -ISRPC-> SVR[%d] failed\n",
+            rf.currentTerm, rf.me, idx)
+        // retry failed RPC
+        if rf.currentTerm == termBeforeSend {
+            rf.mu.Unlock()
+            time.Sleep(10 * time.Millisecond)
+            rf.mu.Lock()
+            go rf.SendAndHandleInstallSnapshotRPC(idx)
+        }
+        return
+    default:
+        DbgPrintf(dISRPC,
+            "[%d] LDR %d -ISRPC-> SVR[%d]: result get [T:%d]\n",
+            rf.currentTerm, rf.me, idx, reply.Term,
+        )
+        termBeforeUpdate := rf.currentTerm
+        if rf.currentTerm < reply.Term {
+            DbgPrintf(dRole,
+                "[%d] LDR %d <-advanced ISRPC- SVR[%d], a new leader exist step back to FLW with new term[%d]",
+                rf.currentTerm, rf.me, idx, reply.Term,
+            )
+            rf.currentTerm = reply.Term
+            rf.role = FOLLOWER
+            rf.voteCount = 0
+            rf.votedFor = -1
+            persistentStateModified = true
+
+            rf.heartbeated = nil
+            ech := make(chan bool)
+            go rf.electionTicker(ech)
+
+            finish, ok := <- ech
+            if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
+            if !finish {
+                DbgPrintf(
+                    dWarn,
+                    "[%d] SVR %d election ticker did not finish\n", rf.currentTerm, rf.me)
+            }
+        }
+
+        if termBeforeUpdate > termBeforeSend {
+            DbgPrintf(dInfo,
+            "[%d] SVR %d -ISRPC-> SVR[%d]: sendTerm:%d, resultTerm:%d RPC result get: old term, drop it\n",
+                rf.currentTerm, rf.me, idx, termBeforeSend, termBeforeUpdate,
+            )
+        } else {
+            DbgPrintf(dInfo,
+            "[%d] SVR %d -ISRPC-> SVR[%d]: result accepted\n",
+                rf.currentTerm, rf.me, idx,
+            )
+        }
+
+        if persistentStateModified { rf.persist() }
+        return
+    }
+}
+
 type AppendEntriesArgs struct {
     Term            int
     LeaderId        int
@@ -269,7 +550,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     // lock 1st
     rf.mu.Lock()
     defer rf.mu.Unlock()
-    // Handle rules for servers
     DbgPrintf(
         dState,
         "[%d] SVR %d <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:v cmtIdx:%d, lastIncluIdx:%d, lstAppliad:%d\n",
@@ -279,36 +559,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.commitIndex,
         rf.lastIncludedIndex, rf.lastApplied,
     )
-    for rf.commitIndex > rf.lastApplied {
-        rf.lastApplied += 1
-        applyChMsg := ApplyMsg {
-            CommandValid: true,
-            Command: rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
-            CommandIndex: rf.lastApplied,
-        }
-        rf.applyCh <- applyChMsg
-        DbgPrintf(
-            dApply,
-            "[%d] SVR %d apply command[%d] into SM\n",
-            rf.currentTerm, rf.me, rf.lastApplied,
-        )
-    }
-    if args.Term > rf.currentTerm {
-        DbgPrintf(
-            dTerm,
-            "[%d] SVR %d receive advanced AERPC from LDR[%d] with TERM[%d] step down to FOLLOWER\n",
-            rf.currentTerm, rf.me, args.LeaderId, args.Term,
-        )
-        rf.currentTerm = args.Term
-        rf.role = FOLLOWER
-        rf.voteCount = 0
-        rf.votedFor = -1
-        persistentStateModified = true
-    }
-    DbgPrintf(
-        dTrace,
-        "[%d] SVR %d all servers rules checked\n", rf.currentTerm, rf.me,
-    )
+    // Handle rules for servers
+    persistentStateModified = rf.checkAllServersRules(args.Term, args.LeaderId)
     // Handle RPC
     switch {
     case args.Term < rf.currentTerm:
@@ -487,15 +739,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         // check again for commitIndex
         for rf.commitIndex > rf.lastApplied {
             rf.lastApplied += 1
-            applyChMsg := ApplyMsg {
-                CommandValid: true,
-                Command: rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
-                CommandIndex: rf.lastApplied,
+            applyMsg := ApplyMsg {
+                CommandValid    : true,
+                Command         : rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
+                CommandIndex    : rf.lastApplied,
+                SnapshotValid   : false,
+                Snapshot        : nil,
+                SnapshotTerm    : -1,
+                SnapshotIndex   : -1,
             }
-            rf.applyCh <- applyChMsg
+            rf.applyCh <- applyMsg
             DbgPrintf(
                 dApply,
-                "[%d] SVR %d apply command[%d] into SM\n",
+                "[%d] SVR %d apply command[%d] into SM (AERPC)\n",
                 rf.currentTerm, rf.me, rf.lastApplied,
             )
         }
@@ -532,7 +788,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     if rf.nextIndex[idx] > len(rf.log) + rf.lastIncludedIndex + 1 {
         log.Fatalf("FAIL: nextIdx[%d]:%d, len(rf.log):%d, lastIncluIdx:%d\n", idx, rf.nextIndex[idx], len(rf.log), rf.lastIncludedIndex)
     }
-    var args AppendEntriesArgs
+    // var args AppendEntriesArgs
     // args = AppendEntriesArgs {
     //     Term:           rf.currentTerm,
     //     LeaderId:       rf.me,
@@ -545,7 +801,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         "[%d] SVR %d |len(log)=%d, nIdx[%d]=%d, lastIncluIdx=%d|\n",
         rf.currentTerm, rf.me, len(rf.log), idx, rf.nextIndex[idx], rf.lastIncludedIndex,
     )
-    args = AppendEntriesArgs{}
+    args := AppendEntriesArgs{}
     args.Term           = rf.currentTerm
     args.LeaderId       = rf.me
     args.LeaderCommit   = rf.commitIndex
@@ -677,14 +933,18 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         // send committed entry to SM and applyCh
         for rf.commitIndex > rf.lastApplied {
             rf.lastApplied += 1
-            applyChMsg := ApplyMsg {
-                CommandValid: true,
-                Command: rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
-                CommandIndex: rf.lastApplied,
+            applyMsg := ApplyMsg {
+                CommandValid    : true,
+                Command         : rf.log[rf.lastApplied-rf.lastIncludedIndex-1].Command,
+                CommandIndex    : rf.lastApplied,
+                SnapshotValid   : false,
+                Snapshot        : nil,
+                SnapshotTerm    : -1,
+                SnapshotIndex   : -1,
             }
-            rf.applyCh <- applyChMsg
+            rf.applyCh <- applyMsg
             DbgPrintf(
-                dApply, "[%d] LDR %d apply [%d] to SM\n", 
+                dApply, "[%d] LDR %d apply [%d] to SM (handle AERPC)\n", 
                 rf.currentTerm, rf.me, rf.lastApplied,
             )
         }
@@ -726,12 +986,29 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
                 } else {
                     rf.nextIndex[idx] = reply.XIndex
                 }
+                if rf.nextIndex[idx] - 1 <= rf.lastIncludedIndex {
+                    DbgPrintf(dConsist,
+                        "[%d] LDR %d  Get a lost SVR[%d], nextIdx[%d] XLen:%d LII:%d\n",
+                        rf.currentTerm, rf.me, idx,
+                        rf.nextIndex[idx], reply.XLen, rf.lastIncludedIndex,
+                    )
+                    // server does not catch up, we should send it with snapshot
+                    // TODO: call install snapshot rpc
+                    go rf.SendAndHandleInstallSnapshotRPC(idx)
+                    return
+                }
             default:
                 // follower's log is too short
                 rf.nextIndex[idx] = reply.XLen
                 if reply.XLen - 1 <= rf.lastIncludedIndex {
+                    DbgPrintf(dConsist,
+                        "[%d] LDR %d  Get a lost SVR[%d], nextIdx[%d] XLen:%d LII:%d\n",
+                        rf.currentTerm, rf.me, idx,
+                        rf.nextIndex[idx], reply.XLen, rf.lastIncludedIndex,
+                    )
                     // server does not catch up, we should send it with snapshot
                     // TODO: call install snapshot rpc
+                    go rf.SendAndHandleInstallSnapshotRPC(idx)
                     return
                 }
             }
@@ -815,9 +1092,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     // handle rules for servers
     DbgPrintf(
         dRVRPC,
-        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:%v, cmtIdx:%d, lstAppliad:%d\n",
+        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
         rf.currentTerm, rf.me, args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm,
-        rf.currentTerm, rf.votedFor, len(rf.log), rf.log[len(rf.log)-1], rf.commitIndex, rf.lastApplied,
+        rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex, rf.lastApplied,
     )
     var role string
     switch rf.role {
@@ -853,8 +1130,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             log.Fatalf("[%d] SVR  %d change persistent state for a stale RVRPC\n", rf.currentTerm, rf.me)
         }
     case (rf.votedFor < 0 || rf.votedFor == args.CandidateId):
-        if rf.log[len(rf.log) - 1].Term <= args.LastLogTerm {
-            if rf.log[len(rf.log) - 1].Term < args.LastLogTerm || len(rf.log) + rf.lastIncludedIndex <= args.LastLogIndex {
+        var lastTerm int
+        if len(rf.log) == 0 {
+            lastTerm = rf.lastIncludedTerm
+        } else {
+            lastTerm = rf.log[len(rf.log)-1].Term
+        }
+        if lastTerm <= args.LastLogTerm {
+            if lastTerm < args.LastLogTerm || len(rf.log) + rf.lastIncludedIndex <= args.LastLogIndex {
                 rf.votedFor = args.CandidateId
                 persistentStateModified = true
                 reply.VoteGranted = true
@@ -884,11 +1167,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     default:
         reply.Term = rf.currentTerm
         reply.VoteGranted = false
-        DbgPrintf(
-            dRVRPC,
-            "[%d] SVR %d  <-RVRPC- SVR[%d] REJECT: votedfor[%d] last log|idx: %d, term: %d|\n",
-            rf.currentTerm, rf.me, args.CandidateId, rf.votedFor, len(rf.log) - 1, rf.log[len(rf.log)-1].Term,
-        )
+        if len(rf.log) == 0 {
+            DbgPrintf(dRVRPC,
+                "[%d] SVR %d <-RVRPC- SVR[%d] REJECT: votedfor[%d] lastLog|idx: %d, term: %d|\n",
+                rf.currentTerm, rf.me, args.CandidateId,
+                rf.votedFor, rf.lastIncludedIndex, rf.lastIncludedTerm,
+            )
+        } else {
+            DbgPrintf(dRVRPC,
+                "[%d] SVR %d <-RVRPC- SVR[%d] REJECT: votedfor[%d] lastLog|idx: %d, term: %d|\n",
+                rf.currentTerm, rf.me, args.CandidateId,
+                rf.votedFor, len(rf.log) - 1, rf.log[len(rf.log)-1].Term,
+            )
+        }
         if persistentStateModified { rf.persist() }
     }
 
@@ -930,12 +1221,16 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
     rf.mu.Lock()
     termBeforeSend := rf.currentTerm
-    args := RequestVoteArgs{
-        Term:           rf.currentTerm,
-        CandidateId:    rf.me,
-        LastLogIndex:   len(rf.log) + rf.lastIncludedIndex,
-        LastLogTerm:    rf.log[len(rf.log) - 1].Term,
+    args := RequestVoteArgs{}
+    args.Term           = rf.currentTerm
+    args.CandidateId    = rf.me
+    args.LastLogIndex   = len(rf.log) + rf.lastIncludedIndex
+    if len(rf.log) == 0 {
+        args.LastLogTerm = rf.lastIncludedTerm
+    } else {
+        args.LastLogTerm = rf.log[len(rf.log)-1].Term
     }
+      
     rf.mu.Unlock()
     reply := RequestVoteReply{ -1, false }
 
@@ -1311,6 +1606,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.log = append(rf.log, Entry{ 0, padding})
     rf.lastIncludedIndex = -1
     rf.lastIncludedTerm = -1
+    rf.snapShot = nil
 
 
     rf.majority     = len(rf.peers) / 2 + 1
