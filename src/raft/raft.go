@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	// "fmt"
 	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
 
@@ -83,7 +84,7 @@ type Raft struct {
     applyCh     chan ApplyMsg
 
     // helper index pointing to the last log's index
-    // currentIndex int
+    currentIndex int
 
     // init term flag ticker implementation is hard to understand so we have this flag to
     // discriminate the situation
@@ -192,7 +193,11 @@ func (rf *Raft) readPersist(data []byte) {
     var lastIncludedIndex int
     var lastIncludedTerm int
     // var snapShot []byte
-    if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&rflog) != nil {
+    if d.Decode(&currentTerm) != nil || 
+        d.Decode(&votedFor) != nil || 
+        d.Decode(&rflog) != nil ||
+        d.Decode(&lastIncludedIndex) != nil ||
+        d.Decode(&lastIncludedTerm) != nil {
         log.Fatalf("Error: Decode problem\n")
     } else {
         rf.mu.Lock()
@@ -203,10 +208,20 @@ func (rf *Raft) readPersist(data []byte) {
         rf.lastIncludedIndex = lastIncludedIndex
         rf.lastIncludedTerm = lastIncludedTerm
         // rf.snapShot = snapShot
+        // recover some other index
+        rf.currentIndex = rf.lastIncludedIndex + len(rf.log)
+        rf.lastApplied = rf.lastIncludedIndex
+        rf.commitIndex = rf.lastIncludedIndex
     }
 }
 
 // --- added by lbx ---
+func (rf *Raft) assert(condition bool, message string) {
+    if !condition {
+        panic(fmt.Sprintf("Error: SVR[%d] %s\n", rf.me, message))
+    }
+}
+
 func (rf *Raft) ApplyCommand(applyCh chan ApplyMsg, command interface{}, commandIndex int) {
 
 }
@@ -219,8 +234,6 @@ func (rf *Raft) ApplyCommand(applyCh chan ApplyMsg, command interface{}, command
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-    // At beginning just set index to 0
-    // index = 4
     // a wrapper for fixing stupid test design
     go func(index int, snapshot []byte) {
         rf.mu.Lock()
@@ -233,19 +246,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
             )
             return
         }
-
-        // if rf.role == LEADER {
-        //     for i := 0; i < len(rf.peers); i++ {
-        //         if i == rf.me { continue }
-        //         if rf.matchIndex[i] < index {
-        //             // DbgPrintf(dInfo,
-        //             //     "[%d] LDR %d Snapshot() called failed, SVR(%d) does not catch up\n",
-        //             //     rf.currentTerm, rf.me, i,
-        //             // )
-        //             index = rf.matchIndex[i]
-        //         }
-        //     }
-        // }
 
         // TODO: not necessary
         if index <= rf.lastIncludedIndex {
@@ -398,6 +398,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         // if rf.lastApplied < rf.lastIncludedIndex { rf.lastApplied = rf.lastIncludedIndex }
         rf.lastApplied = rf.lastIncludedIndex
         if rf.commitIndex < rf.lastIncludedIndex { rf.commitIndex = rf.lastIncludedIndex }
+        rf.currentIndex = rf.lastIncludedIndex + len(rf.log)
 
         applyMsg := ApplyMsg{
             CommandValid    : false,
@@ -419,7 +420,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         )
     }
     if persistentStateModified { rf.persist() }
-
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -552,11 +552,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
     defer rf.mu.Unlock()
     DbgPrintf(
         dState,
-        "[%d] SVR %d <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, lastLog:v cmtIdx:%d, lastIncluIdx:%d, lstAppliad:%d\n",
-        rf.currentTerm, rf.me, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm,
-        len(args.Entries), args.LeaderCommit, rf.currentTerm, rf.votedFor, len(rf.log),
-        //rf.log[len(rf.log)-1],
-        rf.commitIndex,
+        "[%d] SVR %d <-AERPC- LDR[%d], [T:%d, PrevLI:%d, PrevLT:%d, len(Entries)=%d, Lcmt:%d] CurrentState[cTerm:%d, vFor:%d, cIdx:%d len(log)=%d, cmtIdx:%d, lastIncluIdx:%d, lstAppliad:%d\n",
+        rf.currentTerm, rf.me, args.LeaderId, 
+        args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit,
+        rf.currentTerm, rf.votedFor, rf.currentIndex, len(rf.log), rf.commitIndex,
         rf.lastIncludedIndex, rf.lastApplied,
     )
     // Handle rules for servers
@@ -575,31 +574,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             log.Fatalf("[%d] SVR %d change persistent state for a stale AERPC\n", rf.currentTerm, rf.me)
         }
     case ((
-        len(rf.log) + rf.lastIncludedIndex < args.PrevLogIndex) || (
-        args.PrevLogIndex - rf.lastIncludedIndex < 0 ) || (
+        rf.currentIndex < args.PrevLogIndex ) || (
+        args.PrevLogIndex < rf.lastIncludedIndex ) || (
         args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm ) || (
         args.PrevLogIndex > rf.lastIncludedIndex && rf.log[args.PrevLogIndex-rf.lastIncludedIndex-1].Term != args.PrevLogTerm)):
         switch {
-        case len(rf.log) + rf.lastIncludedIndex < args.PrevLogIndex:
+        case rf.currentIndex < args.PrevLogIndex:
             // follower's log is too short:
-            reply.XLen = len(rf.log) + rf.lastIncludedIndex + 1
+            reply.XLen = rf.currentIndex
             DbgPrintf(dConsist, "[%d] SVR %d too short log( %d )\n",
-                rf.currentTerm, rf.me, len(rf.log) + rf.lastIncludedIndex + 1,
+                rf.currentTerm, rf.me, rf.currentIndex,
             )
-        case args.PrevLogIndex - rf.lastIncludedIndex < 0:
+        case args.PrevLogIndex < rf.lastIncludedIndex:
             // server does not have the log to which the prevlogIndex points.
-            reply.XIndex = len(rf.log) + rf.lastIncludedIndex + 1
+            // or server has trimmed the log
+            reply.XIndex = rf.currentIndex
             DbgPrintf(dConsist, "[%d] SVR %d the log has been truncated lastIncludedIndex:%d\n",
                 rf.currentTerm, rf.me, rf.lastIncludedIndex,
             )
         case args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm:
             // Leader conflict with a commited log, this should never happenned
-            log.Fatalln("Commit Conflict")
+            log.Fatalf("Error: Commit Conflict PLI=LII=%d, but PLT=%d LIT=%d",
+                rf.lastIncludedIndex, args.PrevLogTerm, rf.lastIncludedTerm,
+            )
         default:
             conflictTerm := rf.log[args.PrevLogIndex-rf.lastIncludedIndex-1].Term
             firstIdx := args.PrevLogIndex - rf.lastIncludedIndex - 1 - 1
             reply.XTerm = conflictTerm
-            for firstIdx > 0 {
+            for firstIdx >= 0 {
                 if rf.log[firstIdx].Term != conflictTerm { break }
                 firstIdx -= 1
             }
@@ -654,9 +656,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         nextMatchIndex := args.PrevLogIndex + 1
         entryIndex := 0
         for _, entry := range args.Entries {
-            if len(rf.log) + rf.lastIncludedIndex < nextMatchIndex { break }
+            if rf.currentIndex < nextMatchIndex { break }
             if rf.log[nextMatchIndex-rf.lastIncludedIndex-1].Term != entry.Term {
                 rf.log = rf.log[:nextMatchIndex-rf.lastIncludedIndex-1]
+                rf.currentIndex = nextMatchIndex - 1
                 persistentStateModified = true
                 break
             }
@@ -668,6 +671,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             persistentStateModified = true
             entryIndex += 1
             nextMatchIndex += 1
+            rf.currentIndex += 1
         }
 
         if args.LeaderCommit > rf.commitIndex {
@@ -785,18 +789,10 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     termBeforeSend := rf.currentTerm
     aerpcIdx := rf.aerpcIdx
     rf.aerpcIdx += 1
-    if rf.nextIndex[idx] > len(rf.log) + rf.lastIncludedIndex + 1 {
+    if rf.nextIndex[idx] > rf.currentIndex + 1 {
         log.Fatalf("FAIL: nextIdx[%d]:%d, len(rf.log):%d, lastIncluIdx:%d\n", idx, rf.nextIndex[idx], len(rf.log), rf.lastIncludedIndex)
     }
-    // var args AppendEntriesArgs
-    // args = AppendEntriesArgs {
-    //     Term:           rf.currentTerm,
-    //     LeaderId:       rf.me,
-    //     PrevLogIndex:   rf.nextIndex[idx] - 1,
-    //     PrevLogTerm:    rf.log[rf.nextIndex[idx] - 1].Term,
-    //     Entries:        rf.log[rf.nextIndex[idx]:],
-    //     LeaderCommit:   rf.commitIndex,
-    // }
+
     DbgPrintf(dInfo,
         "[%d] SVR %d |len(log)=%d, nIdx[%d]=%d, lastIncluIdx=%d|\n",
         rf.currentTerm, rf.me, len(rf.log), idx, rf.nextIndex[idx], rf.lastIncludedIndex,
@@ -909,7 +905,6 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     // check the result:
     switch {
     case reply.Success:
-
         rf.nextIndex[idx] = args.PrevLogIndex + len(args.Entries) + 1
         rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
         // check commit status
@@ -918,7 +913,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         for ; i < len(rf.log); i++ {
             count := 1
             for peerIdx := range rf.peers {
-                if rf.matchIndex[peerIdx] >= i { count += 1 }
+                if rf.matchIndex[peerIdx] >= i + rf.lastIncludedIndex + 1 { count += 1 }
             }
             if  count >= rf.majority && rf.log[i].Term == rf.currentTerm {
                 rf.commitIndex = i + rf.lastIncludedIndex + 1
@@ -972,21 +967,18 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
             // caused by log inconsistency
             switch {
             case reply.XLen == -1:
-                // follower's log is enough
-                // if args.PrevLogIndex <= rf.lastIncludedIndex {
-                //     // we don't have the log send InstallSnapshot and return
-                //     return
-                // }
                 lastEntryIdx := -1
-                for i := args.PrevLogIndex - rf.lastIncludedIndex - 2; i > 0; i-- {
-                    if rf.log[i].Term == reply.XTerm { lastEntryIdx = i }
+                for i := args.PrevLogIndex - rf.lastIncludedIndex - 2; i >= 0; i-- {
+                    if rf.log[i].Term == reply.XTerm {
+                        lastEntryIdx = i + rf.lastIncludedIndex + 1
+                    }
                 }
                 if lastEntryIdx >= 0 {
                     rf.nextIndex[idx] = lastEntryIdx
                 } else {
                     rf.nextIndex[idx] = reply.XIndex
                 }
-                if rf.nextIndex[idx] - 1 <= rf.lastIncludedIndex {
+                if rf.nextIndex[idx] - 1 < rf.lastIncludedIndex && rf.snapShot != nil {
                     DbgPrintf(dConsist,
                         "[%d] LDR %d  Get a lost SVR[%d], nextIdx[%d] XLen:%d LII:%d\n",
                         rf.currentTerm, rf.me, idx,
@@ -1000,7 +992,7 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
             default:
                 // follower's log is too short
                 rf.nextIndex[idx] = reply.XLen
-                if reply.XLen - 1 <= rf.lastIncludedIndex {
+                if reply.XLen - 1 < rf.lastIncludedIndex && rf.snapShot != nil {
                     DbgPrintf(dConsist,
                         "[%d] LDR %d  Get a lost SVR[%d], nextIdx[%d] XLen:%d LII:%d\n",
                         rf.currentTerm, rf.me, idx,
@@ -1025,7 +1017,6 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
 }
 
 func (rf *Raft) heartBeatThread() {
-
     idx := 0
     for {
         rf.mu.Lock()
@@ -1090,11 +1081,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
     // handle rules for servers
-    DbgPrintf(
-        dRVRPC,
-        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d] CurrentState[cTerm:%d, vFor:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d\n",
-        rf.currentTerm, rf.me, args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm,
-        rf.currentTerm, rf.votedFor, len(rf.log), rf.commitIndex, rf.lastApplied,
+    DbgPrintf(dRVRPC,
+        "[%d] SVR %d  <-RVRPC- SVR[%d], [T:%d, LastLI:%d, LastLT:%d] CurrentState[cTerm:%d, vFor:%d, currentIdx:%d, len(log)=%d, cmtIdx:%d, lstAppliad:%d, lstIncIdx:%d\n",
+        rf.currentTerm, rf.me, args.CandidateId,
+        args.Term, args.LastLogIndex, args.LastLogTerm,
+        rf.currentTerm, rf.votedFor, rf.currentIndex, len(rf.log), rf.commitIndex,
+        rf.lastApplied, rf.lastIncludedIndex,
     )
     var role string
     switch rf.role {
@@ -1131,13 +1123,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         }
     case (rf.votedFor < 0 || rf.votedFor == args.CandidateId):
         var lastTerm int
-        if len(rf.log) == 0 {
+        if rf.currentIndex < rf.lastIncludedIndex {
+            log.Fatalf("Error: SVR[%d] currentIndex(%d) < LastIncludeIndex(%d)",
+                rf.me, rf.currentIndex, rf.lastIncludedIndex,
+            )
+        } else if rf.currentIndex == rf.lastIncludedIndex {
+            // just in case
+            if len(rf.log) != 0 {
+                log.Fatalf("Error: SVR[%d] currentIndex = LastIncludeIndex(%d), but len(log)=%d",
+                    rf.me, rf.lastIncludedIndex, len(rf.log),
+                )
+            }
             lastTerm = rf.lastIncludedTerm
         } else {
+            // just in case
+            if len(rf.log) != rf.currentIndex - rf.lastIncludedIndex {
+                log.Fatalf("Error: SVR[%d] idx conflict, cIdx(%d) LII(%d) len(log)=%d\n",
+                    rf.me, rf.currentIndex, rf.lastIncludedIndex, len(rf.log),
+                )
+            }
             lastTerm = rf.log[len(rf.log)-1].Term
         }
         if lastTerm <= args.LastLogTerm {
-            if lastTerm < args.LastLogTerm || len(rf.log) + rf.lastIncludedIndex <= args.LastLogIndex {
+            if lastTerm < args.LastLogTerm || rf.currentIndex <= args.LastLogIndex {
                 rf.votedFor = args.CandidateId
                 persistentStateModified = true
                 reply.VoteGranted = true
@@ -1167,7 +1175,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     default:
         reply.Term = rf.currentTerm
         reply.VoteGranted = false
-        if len(rf.log) == 0 {
+        if rf.currentIndex < rf.lastIncludedIndex {
+            log.Fatalf("Error: SVR[%d] currentIndex(%d) < LastIncludeIndex(%d)",
+                rf.me, rf.currentIndex, rf.lastIncludedIndex,
+            )
+        } else if rf.currentIndex == rf.lastIncludedIndex {
+            rf.assert(len(rf.log) == 0, fmt.Sprintf(
+                "CI=LII=%d, but len(log)=%d", rf.currentIndex, len(rf.log),
+            ))
             DbgPrintf(dRVRPC,
                 "[%d] SVR %d <-RVRPC- SVR[%d] REJECT: votedfor[%d] lastLog|idx: %d, term: %d|\n",
                 rf.currentTerm, rf.me, args.CandidateId,
@@ -1224,11 +1239,11 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
     args := RequestVoteArgs{}
     args.Term           = rf.currentTerm
     args.CandidateId    = rf.me
-    args.LastLogIndex   = len(rf.log) + rf.lastIncludedIndex
-    if len(rf.log) == 0 {
+    args.LastLogIndex   = rf.currentIndex
+    if rf.currentIndex == rf.lastIncludedIndex {
         args.LastLogTerm = rf.lastIncludedTerm
     } else {
-        args.LastLogTerm = rf.log[len(rf.log)-1].Term
+        args.LastLogTerm = rf.log[rf.currentIndex-rf.lastIncludedIndex-1].Term
     }
       
     rf.mu.Unlock()
@@ -1307,17 +1322,19 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
             rf.role = LEADER
             rf.nextIndex = make([]int, len(rf.peers))
             rf.matchIndex = make([]int, len(rf.peers))
+            rf.assert(len(rf.log) + rf.lastIncludedIndex == rf.currentIndex, fmt.Sprintf(
+                "len(log)=%d + LII(%d) != CI(%d)",
+                len(rf.log), rf.lastIncludedIndex, rf.currentIndex,
+            ))
             for i := range rf.peers {
-                rf.nextIndex[i]     = len(rf.log) + rf.lastIncludedIndex + 1
+                rf.nextIndex[i]     = rf.currentIndex + 1
                 rf.matchIndex[i]    = 0 
             }
-            // lite debug
-            // fmt.Printf("[%d] SERVER[%d] become to LEADER\n", rf.currentTerm, rf.me)
             DbgPrintf(dRole, "[%d] SVR %d become to LEADER\n", rf.currentTerm, rf.me)
             // trigger heartbeat
             go rf.heartBeatThread()
         default:
-            // not enough votes, exit
+            // not enough votes, wait and exit
             DbgPrintf(
                 dInfo, "[%d] LDR %d <-RVRPC- SVR[%d]: not enough votes, wait\n",
                 rf.currentTerm, rf.me, idx,
@@ -1336,7 +1353,6 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
             )
         }
     }
-
 }
 
 func (rf *Raft) electionTicker(c chan bool) {
@@ -1369,30 +1385,12 @@ func (rf *Raft) electionTicker(c chan bool) {
         rf.mu.Unlock()
         return
     }
-    // if heartbeated {
-    //     rf.mu.Unlock()
-    //     return
-    // }
     switch rf.role {
     case LEADER:
         // Leader does not need ticker
         rf.mu.Unlock()
-        // go func() {
-        //     rf.mu.Lock()
-        //     defer rf.mu.Unlock()
-        //     for rf.role == LEADER {
-        //         rf.mu.Unlock()
-        //         time.Sleep(300 * time.Millisecond)
-        //         rf.mu.Lock()
-        //     }
-        // }()
         return
     case CANDIDATE:
-        // if heartbeated {
-        //     rf.mu.Unlock()
-        //     // return
-        //     log.Fatalf("Error: A heartbeated CANDIDATE[%d]", rf.me)
-        // }
         DbgPrintf(dTimer, "[%d] CAN %d rise re-election", rf.currentTerm, rf.me)
         rf.riseElection()
         return
@@ -1481,8 +1479,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
         // do nothing b/c we are not a leader
         isLeader = false
     default:
-        index, term, isLeader = len(rf.log) + rf.lastIncludedIndex + 1, rf.currentTerm, true
+        index, term, isLeader = rf.currentIndex + 1, rf.currentTerm, true
         rf.log = append(rf.log, Entry{ rf.currentTerm, command })
+        rf.currentIndex += 1
         rf.persist()
         DbgPrintf(
             dInfo,
@@ -1518,7 +1517,6 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-
     rf.mu.Lock()
     heartbeated := false
     // startTerm := rf.currentTerm
@@ -1602,9 +1600,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.currentTerm  = 0
     rf.votedFor     = -1
     rf.log = make([]Entry, 0)
-    padding := "PADDING"
-    rf.log = append(rf.log, Entry{ 0, padding})
-    rf.lastIncludedIndex = -1
+    // padding := "PADDING"
+    // rf.log = append(rf.log, Entry{ 0, padding})
+    rf.lastIncludedIndex = 0
     rf.lastIncludedTerm = -1
     rf.snapShot = nil
 
