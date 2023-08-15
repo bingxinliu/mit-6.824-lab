@@ -216,6 +216,7 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 // --- added by lbx ---
+func (rf *Raft) ReadSnapshot(data []byte){}
 func (rf *Raft) assert(condition bool, message string) {
     if !condition {
         panic(fmt.Sprintf("Error: SVR[%d] %s\n", rf.me, message))
@@ -235,6 +236,10 @@ func (rf *Raft) ApplyCommand(applyCh chan ApplyMsg, command interface{}, command
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
     // a wrapper for fixing stupid test design
+    DbgPrintf(dSnap,
+        "[%d] SVR %d Snapshot for idx=%d\n",
+        rf.currentTerm, rf.me, index,
+    )
     go func(index int, snapshot []byte) {
         rf.mu.Lock()
         defer rf.mu.Unlock()
@@ -256,24 +261,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
         rf.log = rf.log[index-rf.lastIncludedIndex:]
         rf.lastIncludedIndex = index
         rf.snapShot = &snapshot
-        rf.persist()
+        DbgPrintf(dSnap,
+            "[%d] SVR %d trimed, LII:%d len(log)=%d\n",
+            rf.currentTerm, rf.me, rf.lastIncludedIndex, len(rf.log),
+        )
         // fixing stupid ingestSnap design
-        // if rf.lastApplied < rf.lastIncludedIndex {
+        if rf.lastApplied < rf.lastIncludedIndex {
             rf.lastApplied = rf.lastIncludedIndex
-        // }
+        }
         if rf.commitIndex < rf.lastIncludedIndex {
             rf.commitIndex = rf.lastIncludedIndex
         }
-        applyMsg := ApplyMsg{
-            CommandValid    : false,
-            Command         : nil,
-            CommandIndex    : -1,
-            SnapshotValid   : true,
-            Snapshot        : *rf.snapShot,
-            SnapshotTerm    : rf.lastIncludedTerm,
-            SnapshotIndex   : rf.lastIncludedIndex,
+        if rf.currentIndex < rf.lastIncludedIndex {
+            rf.currentIndex = rf.lastIncludedIndex
         }
-        rf.applyCh <- applyMsg
+        rf.persist()
+        // applyMsg := ApplyMsg{
+        //     CommandValid    : false,
+        //     Command         : nil,
+        //     CommandIndex    : -1,
+        //     SnapshotValid   : true,
+        //     Snapshot        : *rf.snapShot,
+        //     SnapshotTerm    : rf.lastIncludedTerm,
+        //     SnapshotIndex   : rf.lastIncludedIndex,
+        // }
+        // rf.applyCh <- applyMsg
         DbgPrintf(dSnap,
             "[%d] SVR %d Snapshot() called idx:%d\n",
             rf.currentTerm, rf.me, index,
@@ -371,7 +383,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         // 3. Write data into snapshot file at given offset
         // 4. Reply and wait for more data chunks if done is false
         // 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
-        rf.snapShot = &args.Data
         switch {
         case args.LastIncludeIndex < rf.lastIncludedIndex :
             DbgPrintf(dInfo,
@@ -394,6 +405,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         
         rf.lastIncludedIndex = args.LastIncludeIndex
         rf.lastIncludedTerm = args.LastIncludeTerm
+        rf.snapShot = &args.Data
         // fix stupid ingestSnap design
         // if rf.lastApplied < rf.lastIncludedIndex { rf.lastApplied = rf.lastIncludedIndex }
         rf.lastApplied = rf.lastIncludedIndex
@@ -1621,10 +1633,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+    
+    // restore snapshot
+    if rf.lastIncludedIndex > 0 {
+        snapshot := persister.ReadSnapshot()
+        rf.snapShot = &snapshot
+    }
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
