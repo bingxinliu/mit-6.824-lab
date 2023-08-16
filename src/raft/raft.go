@@ -1089,6 +1089,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
     persistentStateModified := false
+    tickerShouldReset := false
     // lock 1st
     rf.mu.Lock()
     defer rf.mu.Unlock()
@@ -1115,6 +1116,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             "[%d] %s %d  <-advanced RVRPC- SVR[%d], step back to FOLLOWER with new term[%d]",
             rf.currentTerm, role, rf.me, args.CandidateId, args.Term)
         rf.currentTerm = args.Term
+        if rf.role == LEADER {
+            tickerShouldReset = true
+        }
         role, rf.role = "FLW", FOLLOWER
         rf.voteCount = 0
         rf.votedFor = -1
@@ -1208,6 +1212,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             )
         }
         if persistentStateModified { rf.persist() }
+    }
+
+    // just in case a leader fallback and reject RVRPC, in this case we need to rise election ticker
+    if tickerShouldReset {
+        rf.heartbeated = nil
+        ech := make(chan bool)
+        go rf.electionTicker(ech)
+
+        finish, ok := <- ech
+        if !ok { log.Fatalf("Error: SERVER[%d] CHANNEL crashed\n", rf.me) }
+        if !finish {
+            DbgPrintf(
+                dWarn,
+                "[%d] SVR %d  election ticker did not finish\n", rf.currentTerm, rf.me)
+        }
     }
 
 }
@@ -1343,6 +1362,7 @@ func (rf *Raft) SendAndHandleRequestVoteRPC(idx int) {
                 rf.matchIndex[i]    = 0 
             }
             DbgPrintf(dRole, "[%d] SVR %d become to LEADER\n", rf.currentTerm, rf.me)
+            *rf.heartbeated = true
             // trigger heartbeat
             go rf.heartBeatThread()
         default:
