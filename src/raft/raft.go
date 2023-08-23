@@ -804,6 +804,12 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     if rf.nextIndex[idx] > rf.currentIndex + 1 {
         log.Fatalf("FAIL: nextIdx[%d]:%d, len(rf.log):%d, lastIncluIdx:%d\n", idx, rf.nextIndex[idx], len(rf.log), rf.lastIncludedIndex)
     }
+    // if syncRPC && rf.currentIndex > currentIndex {
+    //     DbgPrintf(dInfo,
+    //         "[%d] LDR %d some new command injected, just skip this one\n",
+    //     )
+    //     return
+    // }
 
     DbgPrintf(dInfo,
         "[%d] SVR %d |len(log)=%d, nIdx[%d]=%d, lastIncluIdx=%d|\n",
@@ -827,7 +833,8 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
     if heartbeatAERPC {
         args.Entries = rf.log[0:0]
     } else {
-        args.Entries = rf.log[args.PrevLogIndex-rf.lastIncludedIndex:]
+        args.Entries = make([]Entry, len(rf.log) - (args.PrevLogIndex - rf.lastIncludedIndex))
+        copy(args.Entries, rf.log[args.PrevLogIndex-rf.lastIncludedIndex:])
     }
     var reply = AppendEntriesReply{ -1, -1, -1, -1, false }
     DbgPrintf(
@@ -957,9 +964,9 @@ func (rf *Raft) SendAndHandleAppendEntriesRPC(idx int, heartbeatAERPC bool) {
         }
             
         // check new logs
-        if len(rf.log) + rf.lastIncludedIndex >= rf.nextIndex[idx] {
-            go rf.SendAndHandleAppendEntriesRPC(idx, false)
-        }
+        // if len(rf.log) + rf.lastIncludedIndex >= rf.nextIndex[idx] {
+        //     go rf.SendAndHandleAppendEntriesRPC(idx, false, rf.currentIndex)
+        // }
         DbgPrintf(
             dAERPC,
             "[%d] LDR %d <-AERPC- SVR[%d] accepted, nextIdx[%d], matchIdx[%d]\n",
@@ -1061,7 +1068,9 @@ func (rf *Raft) heartBeatThread() {
 
         // time.Sleep(100 * time.Millisecond)
     }
+    rf.mu.Lock()
     DbgPrintf(dHBeat, "[%d] LDR %d  HB thread down\n", rf.currentTerm, rf.me)
+    rf.mu.Unlock()
 }
 
 // --- added end ---
@@ -1540,7 +1549,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+    rf.mu.Lock()
     DbgPrintf(dInfo, "[%d] SVR %d killed", rf.currentTerm, rf.me)
+    rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
